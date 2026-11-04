@@ -15,7 +15,6 @@ A Node.js Discord bot with moderation, tickets, XP levels, games, dashboards, an
 cp .env.example .env
 # Edit .env and provide the real credentials
 npm ci
-npm run deploy
 npm start
 ```
 
