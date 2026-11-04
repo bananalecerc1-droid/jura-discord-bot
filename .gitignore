@@ -1,0 +1,14 @@
+node_modules/
+.env
+.env.*
+!.env.example
+.DS_Store
+npm-debug.log*
+backups/
+*.bak
+*.bak-*
+*.before-*
+config.json
+*.pem
+*.key
+*.log

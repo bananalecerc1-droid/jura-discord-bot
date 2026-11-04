@@ -1,0 +1,8 @@
+{
+  "guildId": "1374859719046463569",
+  "startTime": 50,
+  "chooseTimeout": 30,
+  "timeBetweenRounds": 10,
+  "allowedRoleId": "1374859719134412951",
+  "prefix": "-"
+}
