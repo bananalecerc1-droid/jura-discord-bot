@@ -268,10 +268,25 @@ module.exports.isDbReady = () => dbReady;
 
 async function initDb() {
   try {
-    await client.batch(
-      SCHEMA_SQL.map(sql => ({ sql, args: [] })),
-      'write'
-    );
+    try {
+      await client.batch(
+        SCHEMA_SQL.map(sql => ({ sql, args: [] })),
+        'write'
+      );
+    } catch (batchErr) {
+      // Some Turso/libSQL deployments reject large or mixed schema batches
+      // with a generic HTTP 400. Retry individually so startup can recover
+      // and expose the exact statement if a schema change is truly invalid.
+      console.warn('[db] Turso schema batch failed; retrying statements individually:', batchErr.message);
+      for (let i = 0; i < SCHEMA_SQL.length; i += 1) {
+        try {
+          await client.execute({ sql: SCHEMA_SQL[i], args: [] });
+        } catch (statementErr) {
+          statementErr.message = `schema statement ${i + 1}/${SCHEMA_SQL.length} failed: ${statementErr.message}`;
+          throw statementErr;
+        }
+      }
+    }
     // Migration: add voice XP columns to existing tables
     const migrations = [
       'ALTER TABLE xp_stats ADD COLUMN voice_total_xp   INTEGER NOT NULL DEFAULT 0',
