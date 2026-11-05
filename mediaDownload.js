@@ -23,8 +23,10 @@ function extractMediaLinks(content) {
   return [...new Set(found)];
 }
 
-// رابط سيرفر cobalt الخاص فيك
-const _mediaCfg = require('./config.json');
+// رابط سيرفر cobalt الخاص فيك. config.json is optional in deployments that
+// provide configuration through environment variables.
+let _mediaCfg = {};
+try { _mediaCfg = require('./config.json'); } catch (_) {}
 const COBALT_API_URL = (process.env.COBALT_API_URL || _mediaCfg.cobaltApiUrl || '').replace(/\/+$/, '');
 
 const IMAGE_URL_RE = /\.(?:jpe?g|png|gif|webp|avif)(?:[?#].*)?$/i;
