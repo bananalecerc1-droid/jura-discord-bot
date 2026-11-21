@@ -53,9 +53,23 @@ async function snapDiscordGuild(client) {
   try { await guild.fetch(); } catch { /* use cached */ }
 
   // Roles
-  const roles = guild.roles.cache
+  const roles = await Promise.all(guild.roles.cache
     .sort((a, b) => b.position - a.position)
-    .map(r => ({
+    .map(async r => {
+      const iconUrl = r.iconURL({ extension: 'png', size: 1024 }) || null;
+      let iconData = null;
+      if (iconUrl) {
+        try {
+          const response = await fetch(iconUrl);
+          if (response.ok) {
+            const bytes = Buffer.from(await response.arrayBuffer());
+            if (bytes.length <= 1024 * 1024) iconData = bytes.toString('base64');
+          }
+        } catch (err) {
+          console.warn(`[backup] Could not download icon for role ${r.name}:`, err.message);
+        }
+      }
+      return ({
       id:          r.id,
       name:        r.name,
       color:       r.hexColor,
@@ -64,8 +78,10 @@ async function snapDiscordGuild(client) {
       mentionable: r.mentionable,
       managed:     r.managed,
       permissions: r.permissions.bitfield.toString(),
-      icon_url:    r.iconURL() || null,
+      icon_url:    iconUrl,
+      icon_data:   iconData,
       unicode_emoji: r.unicodeEmoji || null,
+      });
     }));
 
   // Channels (all types: text, voice, category, forum, announcement, stage …)
@@ -416,16 +432,29 @@ async function restoreBackup(filename, parts) {
     for (const br of backupRoles) {
       let existing = guild.roles.cache.get(br.id)
                   || guild.roles.cache.find(r => r.name === br.name && !r.managed);
+      const roleOptions = {
+        name:        br.name,
+        color:       br.color || '#000000',
+        hoist:       br.hoist,
+        mentionable: br.mentionable,
+        permissions: br.permissions || '0',
+        reason:      'Restored from backup',
+      };
+      // New backups contain icon_data so restoration does not depend on the
+      // original Discord CDN asset still existing. Fall back to icon_url for
+      // older backups, and leave icons untouched if neither field was saved.
+      if (Object.hasOwn(br, 'icon_data')) {
+        if (br.icon_data) roleOptions.icon = Buffer.from(br.icon_data, 'base64');
+        else if (br.icon_url) roleOptions.icon = br.icon_url;
+        else roleOptions.icon = null;
+      } else if (br.icon_url) {
+        roleOptions.icon = br.icon_url;
+      }
+      if (Object.hasOwn(br, 'unicode_emoji')) roleOptions.unicodeEmoji = br.unicode_emoji;
+
       if (existing) {
         try {
-          await existing.edit({
-            name:        br.name,
-            color:       br.color || '#000000',
-            hoist:       br.hoist,
-            mentionable: br.mentionable,
-            permissions: br.permissions || '0',
-            reason:      'Restored from backup',
-          });
+          await existing.edit(roleOptions);
           roleIdMap[br.id] = existing.id;
           updated++;
         } catch {
@@ -433,17 +462,20 @@ async function restoreBackup(filename, parts) {
         }
       } else {
         try {
-          const newRole = await guild.roles.create({
-            name:        br.name,
-            color:       br.color || '#000000',
-            hoist:       br.hoist,
-            mentionable: br.mentionable,
-            permissions: br.permissions || '0',
-            reason:      'Restored from backup',
-          });
+          const newRole = await guild.roles.create(roleOptions);
           roleIdMap[br.id] = newRole.id;
           created++;
         } catch { /* skip un-creatable roles */ }
+      }
+    }
+    const rolePositions = backupRoles
+      .filter(br => roleIdMap[br.id] && Number.isInteger(br.position))
+      .map(br => ({ role: roleIdMap[br.id], position: br.position }));
+    if (rolePositions.length) {
+      try {
+        await guild.roles.setPositions(rolePositions);
+      } catch (err) {
+        console.warn('[backup] Could not fully restore role positions:', err.message);
       }
     }
     results.discord_roles = `${created} created, ${updated} updated`;
