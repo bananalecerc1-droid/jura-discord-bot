@@ -391,7 +391,10 @@ function startWebServer(discordClient) {
       let skipped = 0;
       let failed = 0;
       const pending = [...guild.members.cache.values()];
-      const batchSize = 10;
+      // Discord still rate-limits individual role updates, but a larger
+      // bounded batch lets the client pipeline requests without opening an
+      // unbounded flood of REST calls.
+      const batchSize = 50;
       for (let i = 0; i < pending.length; i += batchSize) {
         const batch = pending.slice(i, i + batchSize);
         await Promise.all(batch.map(async (member) => {
