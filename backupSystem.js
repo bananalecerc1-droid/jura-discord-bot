@@ -114,6 +114,10 @@ async function snapDiscordGuild(client) {
     url:         s.url,
   }));
 
+  // Fetch the complete member cache before recording boosters and role
+  // assignments; otherwise only recently seen members may be included.
+  try { await guild.members.fetch({ withPresences: false }); } catch { /* use cached */ }
+
   // Members who have boosted
   const boosters = guild.members.cache
     .filter(m => m.premiumSince)
@@ -122,6 +126,18 @@ async function snapDiscordGuild(client) {
       username:      m.user.username,
       displayName:   m.displayName,
       boostingSince: m.premiumSinceTimestamp,
+    }));
+
+  // Member role assignments. This must be captured explicitly; Discord does
+  // not provide historical role membership after roles are deleted/recreated.
+  const member_roles = [...guild.members.cache.values()]
+    .filter(m => !m.user.bot)
+    .map(m => ({
+      id: m.id,
+      username: m.user.username,
+      roles: m.roles.cache
+        .filter(r => r.id !== guild.id && !r.managed)
+        .map(r => r.id),
     }));
 
   return {
@@ -145,6 +161,7 @@ async function snapDiscordGuild(client) {
     emojis,
     stickers,
     boosters,
+    member_roles,
   };
 }
 
@@ -305,7 +322,7 @@ function getSchedulerStatus() {
  * Discord server.  `parts` is an array of string keys:
  *   bot_config | xp_stats | warnings | guild_config | tickets |
  *   birthdays  | streaks  | daily_events |
- *   discord_roles | discord_channels | discord_emojis
+ *   discord_roles | discord_channels | discord_emojis | member_roles
  *
  * Returns an object with one key per restored part and a short status string.
  */
@@ -379,7 +396,8 @@ async function restoreBackup(filename, parts) {
   const client = _discordClient;
   const guild  = (client && client.isReady()) ? client.guilds.cache.first() : null;
 
-  if (parts.includes('discord_roles') || parts.includes('discord_channels') || parts.includes('discord_emojis')) {
+  if (parts.includes('discord_roles') || parts.includes('discord_channels') ||
+      parts.includes('discord_emojis') || parts.includes('member_roles')) {
     if (!guild) throw new Error('Discord client is not ready — cannot restore server structure');
   }
 
@@ -405,6 +423,7 @@ async function restoreBackup(filename, parts) {
             color:       br.color || '#000000',
             hoist:       br.hoist,
             mentionable: br.mentionable,
+            permissions: br.permissions || '0',
             reason:      'Restored from backup',
           });
           roleIdMap[br.id] = existing.id;
@@ -419,6 +438,7 @@ async function restoreBackup(filename, parts) {
             color:       br.color || '#000000',
             hoist:       br.hoist,
             mentionable: br.mentionable,
+            permissions: br.permissions || '0',
             reason:      'Restored from backup',
           });
           roleIdMap[br.id] = newRole.id;
@@ -429,6 +449,49 @@ async function restoreBackup(filename, parts) {
     results.discord_roles = `${created} created, ${updated} updated`;
   }
 
+  // Restore member role assignments after roles exist. Older backups created
+  // before member_roles was introduced are left unchanged and report clearly.
+  if (parts.includes('member_roles')) {
+    if (!Array.isArray(snapshot.discord_guild?.member_roles)) {
+      results.member_roles = 'not present in this backup';
+    } else {
+      await guild.roles.fetch();
+      await guild.members.fetch({ withPresences: false });
+      const backupRoleById = new Map(
+        (snapshot.discord_guild.roles || []).map(r => [r.id, r])
+      );
+      const resolveSavedRole = (savedRoleId) => {
+        const direct = guild.roles.cache.get(savedRoleId);
+        if (direct && !direct.managed) return direct;
+        const savedRole = backupRoleById.get(savedRoleId);
+        return savedRole
+          ? guild.roles.cache.find(r => !r.managed && r.name === savedRole.name)
+          : null;
+      };
+      let restored = 0, skipped = 0;
+      for (const savedMember of snapshot.discord_guild.member_roles) {
+        const member = guild.members.cache.get(savedMember.id);
+        if (!member) { skipped++; continue; }
+        const mapped = (savedMember.roles || [])
+          .map(resolveSavedRole)
+          .filter(Boolean)
+          .map(r => r.id);
+        const managed = member.roles.cache.filter(r => r.managed).map(r => r.id);
+        try {
+          await member.roles.set(
+            [...new Set([...managed, ...mapped])],
+            'Restored member roles from backup'
+          );
+          restored++;
+        } catch (err) {
+          skipped++;
+          console.warn(`[backup] Could not restore roles for ${savedMember.id}:`, err.message);
+        }
+      }
+      results.member_roles = `${restored} members restored, ${skipped} skipped`;
+    }
+  }
+
   // Channels
   if (parts.includes('discord_channels') && snapshot.discord_guild?.channels?.length) {
     await guild.channels.fetch();
@@ -437,6 +500,48 @@ async function restoreBackup(filename, parts) {
     const cats   = backupChannels.filter(c => c.type === 4); // GuildCategory
     const others = backupChannels.filter(c => c.type !== 4);
     const catIdMap = {}; // backup category id → current category id
+
+    // Convert saved overwrite targets to IDs in the current guild. Role IDs
+    // normally remain stable, but role names provide a fallback when a role
+    // was deleted and recreated. The @everyone role always uses the guild ID.
+    const backupRoleById = new Map(
+      (snapshot.discord_guild.roles || []).map(r => [r.id, r])
+    );
+    const resolveOverwriteId = (ow) => {
+      if (ow.type === 0 && ow.id === snapshot.discord_guild.id) return guild.id;
+      if (ow.type === 0) {
+        const exact = guild.roles.cache.get(ow.id);
+        if (exact) return exact.id;
+        const savedRole = backupRoleById.get(ow.id);
+        const byName = savedRole && guild.roles.cache.find(
+          r => !r.managed && r.name === savedRole.name
+        );
+        return byName?.id || null;
+      }
+      // Member overwrites can retain their original user ID.
+      return ow.id;
+    };
+    const permissionOverwritesFor = (saved) =>
+      (saved.permission_overwrites || [])
+        .map(ow => ({
+          id: resolveOverwriteId(ow),
+          type: ow.type,
+          allow: BigInt(ow.allow || 0),
+          deny: BigInt(ow.deny || 0),
+        }))
+        .filter(ow => ow.id);
+    const applyChannelSnapshot = async (channel, saved) => {
+      const overwrites = permissionOverwritesFor(saved);
+      if (!Array.isArray(saved.permission_overwrites)) return;
+      try {
+        await channel.permissionOverwrites.set(
+          overwrites,
+          'Restored channel permissions from backup'
+        );
+      } catch (err) {
+        console.warn(`[backup] Could not restore permissions for ${saved.name}:`, err.message);
+      }
+    };
 
     let created = 0;
 
@@ -450,9 +555,12 @@ async function restoreBackup(filename, parts) {
         try {
           const nc = await guild.channels.create({ name: cat.name, type: 4, reason: 'Restored from backup' });
           catIdMap[cat.id] = nc.id;
+          await applyChannelSnapshot(nc, cat);
           created++;
         } catch { /* skip */ }
       }
+      const current = guild.channels.cache.get(catIdMap[cat.id]);
+      if (current) await applyChannelSnapshot(current, cat);
     }
 
     // Text / voice / etc.
@@ -472,9 +580,14 @@ async function restoreBackup(filename, parts) {
           if (ch.slowmode != null) opts.rateLimitPerUser = ch.slowmode;
           if (ch.bitrate  != null) opts.bitrate          = ch.bitrate;
           if (ch.user_limit != null) opts.userLimit      = ch.user_limit;
-          await guild.channels.create(opts);
+          const createdChannel = await guild.channels.create(opts);
+          await applyChannelSnapshot(createdChannel, ch);
           created++;
-        } catch { /* skip */ }
+        } catch (err) {
+          console.warn(`[backup] Could not restore channel ${ch.name}:`, err.message);
+        }
+      } else {
+        await applyChannelSnapshot(existing, ch);
       }
     }
     results.discord_channels = `${created} created`;

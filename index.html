@@ -4528,6 +4528,7 @@ select:focus{
       <div id="restoreServerCol" style="background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:12px">
         <p style="font-size:11px;font-weight:700;text-transform:uppercase;color:var(--muted);letter-spacing:.06em;margin:0 0 10px">Discord Server</p>
         <label class="restore-chk"><input type="checkbox" value="discord_roles" checked> Roles</label>
+        <label class="restore-chk"><input type="checkbox" value="member_roles" checked> Member Role Assignments</label>
         <label class="restore-chk"><input type="checkbox" value="discord_channels" checked> Channels</label>
         <label class="restore-chk"><input type="checkbox" value="discord_emojis" checked> Emojis</label>
         <p id="restoreNoGuild" style="display:none;font-size:11px;color:var(--muted);margin:6px 0 0">⚠️ This backup has no server snapshot</p>
@@ -8684,6 +8685,15 @@ async function submitRestore() {
       .join('');
     resultsEl.innerHTML = lines || '<div>Nothing was changed.</div>';
     resultsEl.style.display = 'block';
+    // Re-fetch Discord-backed data so selectors and dashboard lists use the
+    // newly created role/channel IDs instead of stale pre-restore values.
+    try {
+      await init();
+      await loadBackupsPage();
+    } catch (syncErr) {
+      console.warn('Dashboard sync after restore failed:', syncErr);
+      toast('Restore complete; refresh the dashboard to sync lists', false);
+    }
     toast('Restore complete ✅');
   } else {
     const d = await r.json().catch(() => ({}));
