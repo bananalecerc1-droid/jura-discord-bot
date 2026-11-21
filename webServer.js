@@ -12,6 +12,9 @@ const db = require('./db.js');
 const backup = require('./backupSystem.js');
 const { syncActiveChatRole } = require('./activeChatRole.js');
 
+const roleSyncJobs = new Map();
+const ROLE_SYNC_CONCURRENCY = 25;
+
 const CONFIG_FILE = path.join(__dirname, 'botConfig.json');
 const TOKENS = new Set();
 const DASHBOARD_GUILD_ID = '1374859719046463569';
@@ -371,6 +374,76 @@ function startWebServer(discordClient) {
       console.error('[auto-role/save]', err.message);
       res.status(500).json({ error: err.message });
     }
+  });
+
+  // Non-blocking bulk sync for large guilds. The request returns immediately;
+  // Discord role updates continue in the Node process and can be monitored.
+  app.post('/api/auto-role/sync/start', auth, async (req, res) => {
+    try {
+      const guild = getDashboardGuild(discordClient);
+      if (!guild) return res.status(404).json({ error: `Dashboard guild ${DASHBOARD_GUILD_ID} is unavailable` });
+      const roleId = String(req.body?.roleId || loadConfig().autoRole?.roleId || '');
+      if (!roleId) return res.status(400).json({ error: 'Select a role before syncing.' });
+      const role = await guild.roles.fetch(roleId).catch(() => null);
+      if (!role) return res.status(400).json({ error: 'Selected role was not found in the Jura guild.' });
+      if (role.id === guild.id || role.managed) return res.status(400).json({ error: 'That role cannot be assigned.' });
+      const me = guild.members.me || await guild.members.fetch(discordClient.user.id).catch(() => null);
+      if (!me || role.position >= me.roles.highest.position) {
+        return res.status(400).json({ error: 'The bot role must be higher than the selected role.' });
+      }
+      const existing = [...roleSyncJobs.values()].find(j => j.guildId === guild.id && j.roleId === role.id && j.status === 'running');
+      if (existing) return res.status(409).json({ error: 'A sync for this role is already running.', job: existing });
+
+      const job = {
+        id: crypto.randomUUID(), guildId: guild.id, roleId: role.id, role: role.name,
+        status: 'running', total: 0, processed: 0, added: 0, skipped: 0, failed: 0,
+        startedAt: Date.now(), finishedAt: null, error: null,
+      };
+      roleSyncJobs.set(job.id, job);
+      res.status(202).json({ ok: true, job });
+
+      (async () => {
+        try {
+          await guild.members.fetch({ withPresences: false });
+          const members = [...guild.members.cache.values()];
+          job.total = members.length;
+          for (let i = 0; i < members.length; i += ROLE_SYNC_CONCURRENCY) {
+            const batch = members.slice(i, i + ROLE_SYNC_CONCURRENCY);
+            await Promise.all(batch.map(async (member) => {
+              if (member.user.bot || member.roles.cache.has(role.id)) {
+                job.skipped++;
+              } else {
+                try {
+                  await member.roles.add(role, 'Background Members role sync');
+                  job.added++;
+                } catch (err) {
+                  job.failed++;
+                  console.warn(`[AutoRole] Background sync failed for ${member.user.tag}:`, err.message);
+                }
+              }
+              job.processed++;
+            }));
+          }
+          job.status = 'complete';
+        } catch (err) {
+          job.status = 'failed';
+          job.error = err.message;
+          console.error('[auto-role/background-sync]', err.message);
+        } finally {
+          job.finishedAt = Date.now();
+          setTimeout(() => roleSyncJobs.delete(job.id), 60 * 60 * 1000);
+        }
+      })();
+    } catch (err) {
+      console.error('[auto-role/sync/start]', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/auto-role/sync/status/:jobId', auth, (req, res) => {
+    const job = roleSyncJobs.get(req.params.jobId);
+    if (!job) return res.status(404).json({ error: 'Sync job not found or expired.' });
+    res.json({ ok: true, job });
   });
 
   app.post('/api/auto-role/sync', auth, async (req, res) => {
