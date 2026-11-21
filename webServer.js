@@ -390,18 +390,23 @@ function startWebServer(discordClient) {
       let added = 0;
       let skipped = 0;
       let failed = 0;
-      for (const member of guild.members.cache.values()) {
-        if (member.user.bot || member.roles.cache.has(role.id)) {
-          skipped++;
-          continue;
-        }
-        try {
-          await member.roles.add(role, 'Manual Auto Role sync from dashboard');
-          added++;
-        } catch (err) {
-          failed++;
-          console.warn(`[AutoRole] Sync failed for ${member.user.tag}:`, err.message);
-        }
+      const pending = [...guild.members.cache.values()];
+      const batchSize = 10;
+      for (let i = 0; i < pending.length; i += batchSize) {
+        const batch = pending.slice(i, i + batchSize);
+        await Promise.all(batch.map(async (member) => {
+          if (member.user.bot || member.roles.cache.has(role.id)) {
+            skipped++;
+            return;
+          }
+          try {
+            await member.roles.add(role, 'Manual Auto Role sync from dashboard');
+            added++;
+          } catch (err) {
+            failed++;
+            console.warn(`[AutoRole] Sync failed for ${member.user.tag}:`, err.message);
+          }
+        }));
       }
       res.json({ ok: true, role: role.name, added, skipped, failed, total: guild.memberCount });
     } catch (err) {
